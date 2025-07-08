@@ -26,8 +26,12 @@ struct Camera {
 static Camera cam;
 static bool firstMouse = true;
 static double lastX = 400.0, lastY = 300.0;
+static bool captureCursor = true;
+static bool simulationPaused = false;
+static bool mouseActive = true;
 
 static void mouseCallback(GLFWwindow*, double x, double y){
+    if(!mouseActive) return;
     if(firstMouse){ lastX = x; lastY = y; firstMouse = false; }
     float dx = static_cast<float>(x - lastX);
     float dy = static_cast<float>(lastY - y);
@@ -69,17 +73,24 @@ int main(int argc, char** argv){
     if(!glfwInit()){ std::cerr << "GLFW init failed\n"; return 1; }
     GLFWwindow* win = glfwCreateWindow(800,600,"net",nullptr,nullptr);
     glfwMakeContextCurrent(win);
+    glfwSetInputMode(win, GLFW_STICKY_KEYS, GLFW_TRUE);
     glfwSetInputMode(win, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
     glfwSetCursorPosCallback(win, mouseCallback);
     if(glewInit()!=GLEW_OK){ std::cerr << "GLEW init failed\n"; return 1; }
 
+    std::string savePath = argc>1 ? argv[1] : "";
+    std::string loadPath = argc>2 ? argv[2] : "";
+
     NeuralNet net;
-    if(argc>1){ net.load(argv[1]); } else {
+    if(!loadPath.empty()){ net.load(loadPath); } else {
         net.randomize(4,10,2,1,3);
     }
     GLuint computeProg = compileCompute();
     GLuint renderProg = compileRender();
     double lastSpawn = glfwGetTime();
+    const float MIN_DIST = 0.3f;
+    bool pDown=false;
+    bool spaceDown=false;
 
     GLuint bufEnergy,bufThres,bufType,bufFrom,bufTo,bufWeight;
     glGenBuffers(1,&bufEnergy); glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufEnergy);
@@ -170,6 +181,21 @@ int main(int argc, char** argv){
         float dt = static_cast<float>(t - lastTime);
         lastTime = t;
 
+        int pState = glfwGetKey(win, GLFW_KEY_P);
+        if(pState==GLFW_PRESS && !pDown){
+            captureCursor = !captureCursor;
+            mouseActive = captureCursor;
+            glfwSetInputMode(win, GLFW_CURSOR, captureCursor ? GLFW_CURSOR_DISABLED : GLFW_CURSOR_NORMAL);
+            firstMouse = true;
+            pDown = true;
+        } else if(pState==GLFW_RELEASE) pDown=false;
+
+        int sState = glfwGetKey(win, GLFW_KEY_SPACE);
+        if(sState==GLFW_PRESS && !spaceDown){
+            simulationPaused = !simulationPaused;
+            spaceDown = true;
+        } else if(sState==GLFW_RELEASE) spaceDown=false;
+
         float speed = 2.0f * dt;
         if(glfwGetKey(win,GLFW_KEY_W)==GLFW_PRESS) cam.pos += cam.front*speed;
         if(glfwGetKey(win,GLFW_KEY_S)==GLFW_PRESS) cam.pos -= cam.front*speed;
@@ -182,69 +208,84 @@ int main(int argc, char** argv){
 
         glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-        glUseProgram(computeProg);
-        glUniform1i(ccLoc, (int)net.connections.size());
-        glDispatchCompute((GLuint)net.connections.size()/64+1,1,1);
-        glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        if(!simulationPaused){
+            glUseProgram(computeProg);
+            glUniform1i(ccLoc, (int)net.connections.size());
+            glDispatchCompute((GLuint)net.connections.size()/64+1,1,1);
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-        glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufEnergy);
-        float* ptr = (float*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_READ_ONLY);
-        for(size_t i=0;i<energies.size();++i) energies[i]=ptr[i];
-        glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufEnergy);
+            float* ptr = (float*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_READ_ONLY);
+            for(size_t i=0;i<energies.size();++i) energies[i]=ptr[i];
+            glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 
-        glm::vec3 center(0.f); float sumE=0.f;
-        for(size_t i=0;i<energies.size();++i){ center += energies[i]*positions[i]; sumE += energies[i]; }
-        if(sumE>0.f) center /= sumE;
+            glm::vec3 center(0.f); float sumE=0.f;
+            for(size_t i=0;i<energies.size();++i){ center += energies[i]*positions[i]; sumE += energies[i]; }
+            if(sumE>0.f) center /= sumE;
 
-        for(size_t i=0;i<positions.size();++i){
-            glm::vec3 dir = glm::normalize(center - positions[i]);
-            velocities[i] += dir * dt;
-            positions[i] += velocities[i]*dt;
-            velocities[i] *= 0.98f;
-            if(!connected[i] && glm::length(center - positions[i]) < 0.5f){
-                for(size_t j=0;j<net.neurons.size();++j){
-                    if(energies[j] >= thrs[j]){
-                        Connection c; c.from=j; c.to=i; c.weight=0.5f+dist(rng);
-                        net.connections.push_back(c);
-                        from.push_back(c.from); to.push_back(c.to); weight.push_back(c.weight);
+            for(size_t i=0;i<positions.size();++i){
+                glm::vec3 dir = glm::normalize(center - positions[i]);
+                velocities[i] += dir * dt;
+                positions[i] += velocities[i]*dt;
+                velocities[i] *= 0.98f;
+                if(!connected[i] && glm::length(center - positions[i]) < 0.5f){
+                    for(size_t j=0;j<net.neurons.size();++j){
+                        if(energies[j] >= thrs[j]){
+                            Connection c; c.from=j; c.to=i; c.weight=0.5f+dist(rng);
+                            net.connections.push_back(c);
+                            from.push_back(c.from); to.push_back(c.to); weight.push_back(c.weight);
+                        }
+                    }
+                    connected[i]=true;
+                    connVerts.resize(net.connections.size()*2);
+                    connEner.resize(connVerts.size());
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufFrom);
+                    glBufferData(GL_SHADER_STORAGE_BUFFER, from.size()*sizeof(int), from.data(), GL_STATIC_DRAW);
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufTo);
+                    glBufferData(GL_SHADER_STORAGE_BUFFER, to.size()*sizeof(int), to.data(), GL_STATIC_DRAW);
+                    glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufWeight);
+                    glBufferData(GL_SHADER_STORAGE_BUFFER, weight.size()*sizeof(float), weight.data(), GL_STATIC_DRAW);
+                    glBindBuffer(GL_ARRAY_BUFFER, connBuf);
+                    glBufferData(GL_ARRAY_BUFFER, connVerts.size()*sizeof(glm::vec3), connVerts.data(), GL_DYNAMIC_DRAW);
+                    glBindBuffer(GL_ARRAY_BUFFER, connEnergyBuf);
+                    glBufferData(GL_ARRAY_BUFFER, connEner.size()*sizeof(float), connEner.data(), GL_DYNAMIC_DRAW);
+                }
+            }
+
+            for(size_t i=0;i<positions.size();++i){
+                for(size_t j=i+1;j<positions.size();++j){
+                    glm::vec3 diff = positions[j]-positions[i];
+                    float d = glm::length(diff);
+                    if(d < MIN_DIST && d>1e-4f){
+                        glm::vec3 dir = diff/d;
+                        float off = (MIN_DIST - d)*0.5f;
+                        positions[i] -= dir*off;
+                        positions[j] += dir*off;
                     }
                 }
-                connected[i]=true;
-                connVerts.resize(net.connections.size()*2);
-                connEner.resize(connVerts.size());
-                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufFrom);
-                glBufferData(GL_SHADER_STORAGE_BUFFER, from.size()*sizeof(int), from.data(), GL_STATIC_DRAW);
-                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufTo);
-                glBufferData(GL_SHADER_STORAGE_BUFFER, to.size()*sizeof(int), to.data(), GL_STATIC_DRAW);
-                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufWeight);
-                glBufferData(GL_SHADER_STORAGE_BUFFER, weight.size()*sizeof(float), weight.data(), GL_STATIC_DRAW);
-                glBindBuffer(GL_ARRAY_BUFFER, connBuf);
-                glBufferData(GL_ARRAY_BUFFER, connVerts.size()*sizeof(glm::vec3), connVerts.data(), GL_DYNAMIC_DRAW);
-                glBindBuffer(GL_ARRAY_BUFFER, connEnergyBuf);
-                glBufferData(GL_ARRAY_BUFFER, connEner.size()*sizeof(float), connEner.data(), GL_DYNAMIC_DRAW);
             }
-        }
 
-        if(t - lastSpawn > 5.0){
-            Neuron n; n.position = glm::vec3(dist(rng)*3.f, dist(rng)*3.f, dist(rng)*3.f);
-            n.type = NeuronType::Excitatory; n.energy = 0.f; n.threshold = 1.f;
-            net.neurons.push_back(n);
-            energies.push_back(0.f);
-            thrs.push_back(1.f);
-            types.push_back((int)n.type);
-            velocities.push_back(glm::vec3(dist(rng),dist(rng),dist(rng)));
-            connected.push_back(false);
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufEnergy);
-            glBufferData(GL_SHADER_STORAGE_BUFFER, energies.size()*sizeof(float), energies.data(), GL_DYNAMIC_DRAW);
-            glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,bufEnergy);
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufThres);
-            glBufferData(GL_SHADER_STORAGE_BUFFER, thrs.size()*sizeof(float), thrs.data(), GL_STATIC_DRAW);
-            glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufType);
-            glBufferData(GL_SHADER_STORAGE_BUFFER, types.size()*sizeof(int), types.data(), GL_STATIC_DRAW);
-            positions.push_back(n.position);
-            glBindBuffer(GL_ARRAY_BUFFER, posBuf);
-            glBufferData(GL_ARRAY_BUFFER, positions.size()*sizeof(glm::vec3), positions.data(), GL_DYNAMIC_DRAW);
-            lastSpawn = t;
+            if(t - lastSpawn > 5.0){
+                Neuron n; n.position = glm::vec3(dist(rng)*3.f, dist(rng)*3.f, dist(rng)*3.f);
+                n.type = NeuronType::Excitatory; n.energy = 0.f; n.threshold = 1.f;
+                net.neurons.push_back(n);
+                energies.push_back(0.f);
+                thrs.push_back(1.f);
+                types.push_back((int)n.type);
+                velocities.push_back(glm::vec3(dist(rng),dist(rng),dist(rng)));
+                connected.push_back(false);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufEnergy);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, energies.size()*sizeof(float), energies.data(), GL_DYNAMIC_DRAW);
+                glBindBufferBase(GL_SHADER_STORAGE_BUFFER,0,bufEnergy);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufThres);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, thrs.size()*sizeof(float), thrs.data(), GL_STATIC_DRAW);
+                glBindBuffer(GL_SHADER_STORAGE_BUFFER, bufType);
+                glBufferData(GL_SHADER_STORAGE_BUFFER, types.size()*sizeof(int), types.data(), GL_STATIC_DRAW);
+                positions.push_back(n.position);
+                glBindBuffer(GL_ARRAY_BUFFER, posBuf);
+                glBufferData(GL_ARRAY_BUFFER, positions.size()*sizeof(glm::vec3), positions.data(), GL_DYNAMIC_DRAW);
+                lastSpawn = t;
+            }
         }
 
         for(size_t i=0;i<net.connections.size();++i){
@@ -285,7 +326,7 @@ int main(int argc, char** argv){
         glfwPollEvents();
     }
 
-    if(argc>2) net.save(argv[2]);
+    if(!savePath.empty()) net.save(savePath);
     glfwDestroyWindow(win); glfwTerminate();
     return 0;
 }
